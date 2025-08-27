@@ -1,3 +1,4 @@
+import sys
 import speech_recognition as sr
 import sounddevice as sd
 import numpy as np
@@ -16,6 +17,10 @@ import threading
 import wave
 import urllib.error
 import json
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
+                             QTextEdit, QPushButton, QWidget, QLabel, QComboBox)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QPalette, QColor
 
 # ---------- CONFIG ----------
 MEMORY_FILE = "shakti_memory.json"
@@ -228,39 +233,168 @@ def speak_in_memory(text, lang, voice="shimmer"):
     except Exception as e:
         logging.error(f"TTS error: {e}")
 
+# ---------- WORKER THREAD ----------
+class WorkerThread(QThread):
+    finished = pyqtSignal(str, str)
+    status_update = pyqtSignal(str)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.is_running = True
+        
+    def run(self):
+        self.status_update.emit("🤖 Shakti ready. Speak in English, Hindi, or Marathi.")
+        load_memory()
+        calibrate_microphone()
+        speak_in_memory("Shakti online, ready to assist.", "en")
+
+        global last_command_time
+        last_command_time = time.time()
+
+        while self.is_running:
+            try:
+                # Recalibrate mic every 60 sec
+                if time.time() - last_command_time > 60:
+                    calibrate_microphone()
+                    last_command_time = time.time()
+
+                user_input, detected_lang = asyncio.run(listen_to_user())
+                if not user_input:
+                    continue
+
+                if user_input.lower() in ["exit", "quit", "stop", "bye"]:
+                    self.status_update.emit("👋 Shutting down...")
+                    speak_in_memory("Goodbye, until next time.", detected_lang)
+                    break
+
+                self.status_update.emit(f"User: {user_input}")
+                ai_response = asyncio.run(ask_groq(user_input, detected_lang))
+                self.finished.emit(ai_response, detected_lang)
+                speak_in_memory(ai_response, detected_lang)
+
+            except Exception as e:
+                logging.error(f"Main loop error: {e}")
+                speak_in_memory("Apologies, something went wrong. Please try again.", "en")
+                self.status_update.emit(f"Error: {str(e)}")
+    
+    def stop(self):
+        self.is_running = False
+        self.quit()
+        self.wait()
+
+# ---------- UI CLASS ----------
+class ShaktiUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.worker_thread = None
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle("Shakti Voice Assistant")
+        self.setGeometry(100, 100, 800, 600)
+        
+        # Central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Layouts
+        main_layout = QVBoxLayout()
+        controls_layout = QHBoxLayout()
+        
+        # Text display
+        self.text_display = QTextEdit()
+        self.text_display.setReadOnly(True)
+        self.text_display.setFont(QFont("Arial", 12))
+        
+        # Status label
+        self.status_label = QLabel("Status: Ready")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        
+        # Buttons
+        self.start_button = QPushButton("Start Listening")
+        self.start_button.clicked.connect(self.start_listening)
+        
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.clicked.connect(self.stop_listening)
+        self.stop_button.setEnabled(False)
+        
+        # Language selection
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems(["English", "Hindi", "Marathi"])
+        self.lang_combo.currentIndexChanged.connect(self.change_language)
+        
+        # Add widgets to layouts
+        controls_layout.addWidget(self.start_button)
+        controls_layout.addWidget(self.stop_button)
+        controls_layout.addWidget(QLabel("Language:"))
+        controls_layout.addWidget(self.lang_combo)
+        controls_layout.addStretch()
+        
+        main_layout.addWidget(self.text_display)
+        main_layout.addLayout(controls_layout)
+        main_layout.addWidget(self.status_label)
+        
+        central_widget.setLayout(main_layout)
+        
+        # Set dark theme
+        self.set_dark_theme()
+        
+    def set_dark_theme(self):
+        dark_palette = QPalette()
+        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.WindowText, Qt.white)
+        dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
+        dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+        dark_palette.setColor(QPalette.Text, Qt.white)
+        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ButtonText, Qt.white)
+        dark_palette.setColor(QPalette.BrightText, Qt.red)
+        dark_palette.setColor(QPalette.Highlight, QColor(142, 45, 197).lighter())
+        dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+        self.setPalette(dark_palette)
+        
+    def start_listening(self):
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.text_display.append("Starting Shakti...")
+        
+        self.worker_thread = WorkerThread()
+        self.worker_thread.finished.connect(self.display_response)
+        self.worker_thread.status_update.connect(self.update_status)
+        self.worker_thread.start()
+        
+    def stop_listening(self):
+        if self.worker_thread:
+            self.worker_thread.stop()
+            self.worker_thread = None
+        
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.update_status("Stopped")
+        
+    def display_response(self, response, lang):
+        self.text_display.append(f"🤖 Shakti: {response}")
+        
+    def update_status(self, message):
+        self.status_label.setText(f"Status: {message}")
+        if not message.startswith("User:"):
+            self.text_display.append(message)
+        
+    def change_language(self, index):
+        global preferred_language
+        languages = ["en", "hi", "mr"]
+        if index < len(languages):
+            preferred_language = languages[index]
+            self.text_display.append(f"Language changed to {self.lang_combo.currentText()}")
+
 # ---------- MAIN ----------
-async def main():
-    print("🤖 Shakti ready. Speak in English, Hindi, or Marathi. Say 'exit' to quit.")
-    load_memory()
-    calibrate_microphone()
-    speak_in_memory("Shakti online, ready to assist.", "en")
-
-    global last_command_time
-    last_command_time = time.time()
-
-    while True:
-        try:
-            # Recalibrate mic every 60 sec
-            if time.time() - last_command_time > 60:
-                calibrate_microphone()
-                last_command_time = time.time()
-
-            user_input, detected_lang = await listen_to_user()
-            if not user_input:
-                continue
-
-            if user_input.lower() in ["exit", "quit", "stop", "bye"]:
-                print("👋 Shutting down...")
-                speak_in_memory("Goodbye, until next time.", detected_lang)
-                break
-
-            ai_response = await ask_groq(user_input, detected_lang)
-            print(f"🤖 Shakti: {ai_response}")
-            speak_in_memory(ai_response, detected_lang)
-
-        except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            speak_in_memory("Apologies, something went wrong. Please try again.", "en")
+def main():
+    app = QApplication(sys.argv)
+    window = ShaktiUI()
+    window.show()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
